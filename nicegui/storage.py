@@ -16,7 +16,13 @@ from starlette.responses import Response
 from . import core, helpers, observables
 from .context import context
 from .observables import ObservableDict
-from .persistence import FilePersistentDict, PersistentDict, ReadOnlyDict, RedisPersistentDict
+from .persistence import (
+    FileStorageBackend,
+    PersistentDict,
+    ReadOnlyDict,
+    RedisStorageBackend,
+    StorageBackend,
+)
 from .persistence.pseudo_persistent_dict import PseudoPersistentDict
 
 request_contextvar: contextvars.ContextVar[Request | None] = contextvars.ContextVar('request_var', default=None)
@@ -92,6 +98,9 @@ class Storage:
     max_tab_storage_age: float = timedelta(days=30).total_seconds()
     '''Maximum age in seconds before tab storage is automatically purged. Defaults to 30 days.'''
 
+    backend: StorageBackend | None = None
+    '''Storage backend to use. Defaults to None, which selects file or Redis storage from the settings above.'''
+
     def __init__(self) -> None:
         self._general = Storage._create_persistent_dict(GENERAL_ID)
         self._users: dict[str, PersistentDict] = {}
@@ -101,12 +110,18 @@ class Storage:
         user storage out from under a request that has not yet accessed app.storage.user.'''
 
     @staticmethod
-    def _create_persistent_dict(id: str) -> PersistentDict:  # pylint: disable=redefined-builtin
+    def _get_backend() -> StorageBackend:
+        """Return the configured backend, or build the default one from the settings above."""
+        if Storage.backend is not None:
+            return Storage.backend
         if Storage.redis_url:
-            ttl = int(core.app.storage.max_tab_storage_age + TTL_BUFFER_SECONDS) if id.startswith(TAB_PREFIX) else None
-            return RedisPersistentDict(url=Storage.redis_url, id=id, key_prefix=Storage.redis_key_prefix, ttl=ttl)
-        else:
-            return FilePersistentDict(Storage.path / f'storage-{id}.json', encoding='utf-8')
+            return RedisStorageBackend(url=Storage.redis_url, key_prefix=Storage.redis_key_prefix)
+        return FileStorageBackend(Storage.path)
+
+    @staticmethod
+    def _create_persistent_dict(id: str) -> PersistentDict:  # pylint: disable=redefined-builtin
+        ttl = core.app.storage.max_tab_storage_age + TTL_BUFFER_SECONDS if id.startswith(TAB_PREFIX) else None
+        return Storage._get_backend().create(id, ttl=ttl)
 
     @property
     def browser(self) -> ReadOnlyDict | dict:
@@ -180,10 +195,9 @@ class Storage:
     async def _create_tab_storage(self, tab_id: str) -> None:
         """Create tab storage for the given tab ID."""
         if tab_id not in self._tabs:
-            if Storage.redis_url:
-                self._tabs[tab_id] = Storage._create_persistent_dict(f'{TAB_PREFIX}{tab_id}')
-                tab = self._tabs[tab_id]
-                assert isinstance(tab, PersistentDict)
+            if Storage._get_backend().persists_tab_storage:
+                tab = Storage._create_persistent_dict(f'{TAB_PREFIX}{tab_id}')
+                self._tabs[tab_id] = tab
                 await tab.initialize()
             else:
                 self._tabs[tab_id] = ObservableDict()
@@ -191,7 +205,7 @@ class Storage:
     def copy_tab(self, old_tab_id: str, tab_id: str) -> None:
         """Copy the tab storage to a new tab. (For internal use only.)"""
         if old_tab_id in self._tabs:
-            if Storage.redis_url:
+            if Storage._get_backend().persists_tab_storage:
                 self._tabs[tab_id] = Storage._create_persistent_dict(f'{TAB_PREFIX}{tab_id}')
             else:
                 self._tabs[tab_id] = ObservableDict()
@@ -209,12 +223,7 @@ class Storage:
         if not helpers.is_pytest():
             context.client.storage.clear()
         self._tabs.clear()
-        for filepath in self.path.glob('storage-*.json'):
-            helpers.unlink_with_retry(filepath, missing_ok=True)
-        for tmp_path in self.path.glob('storage-*.json.tmp'):
-            helpers.unlink_with_retry(tmp_path, missing_ok=True)  # an in-flight backup releases it from a worker thread
-        if self.path.exists():
-            self.path.rmdir()
+        Storage._get_backend().clear()
 
     async def on_shutdown(self) -> None:
         """Close all persistent storage. (For internal use only.)"""
